@@ -10,6 +10,19 @@ const socket = io(SERVER_URL, {
   autoConnect: true,
 });
 
+function getOrCreatePlayerId() {
+  const existing = localStorage.getItem("tilerush_player_id");
+
+  if (existing) return existing;
+
+  const id =
+    crypto?.randomUUID?.() ||
+    `player-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  localStorage.setItem("tilerush_player_id", id);
+  return id;
+}
+
 function formatClock(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "Just now";
@@ -20,6 +33,13 @@ function formatClock(value) {
   });
 }
 
+function formatCountdown(ms) {
+  const safeMs = Math.max(0, ms || 0);
+  const minutes = Math.floor(safeMs / 60000);
+  const seconds = Math.floor((safeMs % 60000) / 1000);
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
 function App() {
   const boardRef = useRef(null);
 
@@ -27,8 +47,13 @@ function App() {
   const [joined, setJoined] = useState(false);
   const [player, setPlayer] = useState(null);
 
-  const [playerName, setPlayerName] = useState("");
-  const [selectedTeam, setSelectedTeam] = useState("violet");
+  const [playerId] = useState(getOrCreatePlayerId);
+  const [playerName, setPlayerName] = useState(
+    localStorage.getItem("tilerush_player_name") || ""
+  );
+  const [selectedTeam, setSelectedTeam] = useState(
+    localStorage.getItem("tilerush_team_id") || "violet"
+  );
 
   const [gridSize, setGridSize] = useState(24);
   const [tiles, setTiles] = useState([]);
@@ -37,14 +62,19 @@ function App() {
   const [leaderboard, setLeaderboard] = useState([]);
   const [teamStats, setTeamStats] = useState([]);
   const [activityFeed, setActivityFeed] = useState([]);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatDraft, setChatDraft] = useState("");
+
+  const [round, setRound] = useState(null);
+  const [roundHistory, setRoundHistory] = useState([]);
+  const [roundTimeLeft, setRoundTimeLeft] = useState(0);
+  const [winnerModal, setWinnerModal] = useState(null);
 
   const [selectedTile, setSelectedTile] = useState(null);
+  const [tileHistory, setTileHistory] = useState([]);
   const [toast, setToast] = useState("");
   const [lastCapturedTileId, setLastCapturedTileId] = useState(null);
   const [cursors, setCursors] = useState({});
-
-  const [chatMessages, setChatMessages] = useState([]);
-  const [chatDraft, setChatDraft] = useState("");
 
   useEffect(() => {
     socket.on("connect", () => setConnected(true));
@@ -65,7 +95,7 @@ function App() {
 
     socket.on("tile:claimed", ({ tile, leaderboard, teamStats }) => {
       setTiles((current) =>
-        current.map((item) => (item.id === tile.id ? tile : item)),
+        current.map((item) => (item.id === tile.id ? tile : item))
       );
 
       setLeaderboard(leaderboard || []);
@@ -74,6 +104,7 @@ function App() {
       setLastCapturedTileId(tile.id);
 
       window.setTimeout(() => setLastCapturedTileId(null), 650);
+      loadTileHistory(tile.id);
     });
 
     socket.on("presence:update", ({ onlineCount, leaderboard, teamStats }) => {
@@ -84,6 +115,16 @@ function App() {
 
     socket.on("activity:new", (event) => {
       setActivityFeed((current) => [event, ...current].slice(0, 30));
+    });
+
+    socket.on("chat:new", (message) => {
+      setChatMessages((current) => [...current, message].slice(-40));
+    });
+
+    socket.on("round:ended", ({ winner, roundHistory, state }) => {
+      setWinnerModal(winner);
+      setRoundHistory(roundHistory || []);
+      hydrateState(state);
     });
 
     socket.on("cursor:update", (cursor) => {
@@ -101,10 +142,6 @@ function App() {
       });
     });
 
-    socket.on("chat:new", (message) => {
-      setChatMessages((current) => [...current, message].slice(-40));
-    });
-
     return () => {
       socket.off("connect");
       socket.off("disconnect");
@@ -114,11 +151,25 @@ function App() {
       socket.off("tile:claimed");
       socket.off("presence:update");
       socket.off("activity:new");
+      socket.off("chat:new");
+      socket.off("round:ended");
       socket.off("cursor:update");
       socket.off("cursor:remove");
-      socket.off("chat:new");
     };
   }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (!round?.endsAt) {
+        setRoundTimeLeft(0);
+        return;
+      }
+
+      setRoundTimeLeft(new Date(round.endsAt).getTime() - Date.now());
+    }, 500);
+
+    return () => window.clearInterval(timer);
+  }, [round]);
 
   function hydrateState(state) {
     if (!state) return;
@@ -131,6 +182,8 @@ function App() {
     setTeamStats(state.teamStats || []);
     setActivityFeed(state.activityFeed || []);
     setChatMessages(state.chatMessages || []);
+    setRound(state.round || null);
+    setRoundHistory(state.roundHistory || []);
   }
 
   function joinArena(event) {
@@ -139,6 +192,7 @@ function App() {
     socket.emit(
       "player:join",
       {
+        playerId,
         name: playerName,
         teamId: selectedTeam,
       },
@@ -148,8 +202,12 @@ function App() {
           return;
         }
 
+        localStorage.setItem("tilerush_player_id", response.user.id);
+        localStorage.setItem("tilerush_player_name", response.user.name);
+        localStorage.setItem("tilerush_team_id", response.user.teamId);
+
         setPlayer(response.user);
-      },
+      }
     );
   }
 
@@ -157,11 +215,23 @@ function App() {
     if (!tile) return;
 
     setSelectedTile(tile);
+    loadTileHistory(tile.id);
 
     socket.emit("tile:claim", { tileId: tile.id }, (response) => {
       if (!response?.ok) {
         showToast(response?.reason || "Could not claim tile.");
       }
+    });
+  }
+
+  function loadTileHistory(tileId) {
+    socket.emit("tile:history", { tileId }, (response) => {
+      if (!response?.ok) {
+        setTileHistory([]);
+        return;
+      }
+
+      setTileHistory(response.history || []);
     });
   }
 
@@ -202,12 +272,12 @@ function App() {
 
   const claimedCount = useMemo(
     () => tiles.filter((tile) => tile.ownerId).length,
-    [tiles],
+    [tiles]
   );
 
   const myTiles = useMemo(
     () => tiles.filter((tile) => tile.ownerId === player?.id).length,
-    [tiles, player],
+    [tiles, player]
   );
 
   const claimPercent = Math.round((claimedCount / (tiles.length || 1)) * 100);
@@ -221,8 +291,8 @@ function App() {
           <p className="eyebrow">Realtime Multiplayer Territory Arena</p>
           <h1>TileRush Arena</h1>
           <p className="subtitle">
-            Capture tiles, expand territory, attack nearby rivals, and climb the
-            live leaderboard. Every move is synced instantly.
+            Capture tiles, expand territory, attack nearby rivals, chat live,
+            and win timed rounds. Your player identity survives refreshes.
           </p>
 
           <form className="join-form" onSubmit={joinArena}>
@@ -278,19 +348,39 @@ function App() {
     <main className="arena-page">
       {toast && <div className="toast">{toast}</div>}
 
+      {winnerModal && (
+        <div className="winner-backdrop">
+          <section className="winner-modal">
+            <p className="eyebrow">Round Complete</p>
+            <h1>{winnerModal.name || "No winner"}</h1>
+            <p>
+              Won the round with{" "}
+              <strong>{winnerModal.score || 0}</strong> controlled tiles.
+            </p>
+            <button
+              className="primary-button"
+              onClick={() => setWinnerModal(null)}
+            >
+              Continue
+            </button>
+          </section>
+        </div>
+      )}
+
       <header className="topbar">
         <div>
           <p className="eyebrow">TileRush Arena</p>
           <h1>Live Territory Control</h1>
           <p className="topbar-copy">
-            Cooldowns, tile locks, adjacent expansion, team scoring, and
-            real-time multiplayer updates.
+            Timed rounds, persistent board state, chat, team scoring, tile
+            history, cooldowns, locks, and real-time multiplayer updates.
           </p>
         </div>
 
         <div className="topbar-stats">
           <StatCard label="Online" value={onlineCount} />
           <StatCard label="Your tiles" value={myTiles} />
+          <StatCard label="Round ends" value={formatCountdown(roundTimeLeft)} />
           <StatCard label="Map claimed" value={`${claimPercent}%`} />
         </div>
       </header>
@@ -299,11 +389,14 @@ function App() {
         <aside className="panel">
           <div className="panel-header">
             <h2>Your Player</h2>
-            <span className="mini-chip">Live</span>
+            <span className="mini-chip">Session saved</span>
           </div>
 
           <div className="player-card">
-            <span className="avatar" style={{ background: player?.teamColor }}>
+            <span
+              className="avatar"
+              style={{ background: player?.teamColor }}
+            >
               {player?.name?.[0]?.toUpperCase()}
             </span>
             <div>
@@ -316,7 +409,8 @@ function App() {
             <h3>Rules</h3>
             <p>First tile can be anywhere.</p>
             <p>After that, expand only from your existing territory.</p>
-            <p>Captured tiles are briefly locked from attacks.</p>
+            <p>Enemy tiles can be attacked only if adjacent.</p>
+            <p>Captured tiles are temporarily locked.</p>
           </div>
 
           <div className="panel-header">
@@ -334,6 +428,26 @@ function App() {
                   <span>{team.name}</span>
                 </div>
                 <strong>{team.score}</strong>
+              </div>
+            ))}
+          </div>
+
+          <div className="round-history">
+            <h3>Recent Rounds</h3>
+            {roundHistory.length === 0 && (
+              <p className="empty">No completed rounds yet.</p>
+            )}
+
+            {roundHistory.map((item) => (
+              <div key={item.id} className="round-row">
+                <span
+                  className="team-dot"
+                  style={{ background: item.winningTeamColor }}
+                />
+                <div>
+                  <strong>{item.winningTeamName || "No winner"}</strong>
+                  <p>{item.winningScore || 0} tiles</p>
+                </div>
               </div>
             ))}
           </div>
@@ -461,6 +575,25 @@ function App() {
             ) : (
               <p>Hover or click a tile to inspect it.</p>
             )}
+
+            <div className="history-list">
+              <h3>Capture History</h3>
+              {tileHistory.length === 0 && (
+                <p className="empty">Click a tile to load history.</p>
+              )}
+
+              {tileHistory.map((item) => (
+                <div key={item.id} className="history-row">
+                  <strong>{item.playerName}</strong>
+                  <p>
+                    {item.type === "capture"
+                      ? `Captured from ${item.previousOwnerName || "unknown"}`
+                      : "Claimed this tile"}{" "}
+                    · {formatClock(item.createdAt)}
+                  </p>
+                </div>
+              ))}
+            </div>
           </div>
 
           <div className="chat-box">
@@ -468,9 +601,7 @@ function App() {
 
             <div className="chat-messages">
               {chatMessages.length === 0 && (
-                <p className="empty">
-                  No messages yet. Start the conversation.
-                </p>
+                <p className="empty">No messages yet. Start the conversation.</p>
               )}
 
               {chatMessages.map((message) => (

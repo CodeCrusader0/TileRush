@@ -13,6 +13,7 @@ const GRID_SIZE = 24;
 const TOTAL_TILES = GRID_SIZE * GRID_SIZE;
 const CLAIM_COOLDOWN_MS = 1200;
 const TILE_LOCK_MS = 8000;
+const ROUND_DURATION_MS = 5 * 60 * 1000;
 const MAX_FEED_EVENTS = 30;
 const MAX_CHAT_MESSAGES = 40;
 
@@ -130,21 +131,54 @@ const chatMessageSchema = new mongoose.Schema(
   }
 );
 
-const ChatMessage =
-  mongoose.models.ChatMessage ||
-  mongoose.model("ChatMessage", chatMessageSchema);
+const roundSchema = new mongoose.Schema(
+  {
+    roundId: {
+      type: String,
+      required: true,
+      unique: true,
+      index: true,
+    },
+    startedAt: Date,
+    endsAt: Date,
+    status: {
+      type: String,
+      enum: ["active", "completed"],
+      default: "active",
+    },
+    winningTeamId: String,
+    winningTeamName: String,
+    winningTeamColor: String,
+    winningScore: Number,
+  },
+  {
+    timestamps: true,
+  }
+);
 
 const Tile = mongoose.models.Tile || mongoose.model("Tile", tileSchema);
 const CaptureEvent =
   mongoose.models.CaptureEvent ||
   mongoose.model("CaptureEvent", captureEventSchema);
+const ChatMessage =
+  mongoose.models.ChatMessage ||
+  mongoose.model("ChatMessage", chatMessageSchema);
+const Round = mongoose.models.Round || mongoose.model("Round", roundSchema);
 
 let databaseConnected = false;
 let tiles = [];
+let currentRound = null;
+
 const users = new Map();
+const socketToPlayer = new Map();
 const lastClaimByUser = new Map();
 const activityFeed = [];
 const chatMessages = [];
+let roundHistory = [];
+
+function createRoundId() {
+  return `round-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
 
 function createEmptyTiles() {
   return Array.from({ length: TOTAL_TILES }, (_, id) => ({
@@ -175,6 +209,21 @@ function mapDbTile(tile) {
     claimedAt: tile.claimedAt || null,
     lockedUntil: tile.lockedUntil || null,
     version: tile.version || 0,
+  };
+}
+
+function mapRound(round) {
+  if (!round) return null;
+
+  return {
+    id: round.roundId,
+    startedAt: round.startedAt,
+    endsAt: round.endsAt,
+    status: round.status,
+    winningTeamId: round.winningTeamId || null,
+    winningTeamName: round.winningTeamName || null,
+    winningTeamColor: round.winningTeamColor || null,
+    winningScore: round.winningScore || 0,
   };
 }
 
@@ -224,6 +273,71 @@ async function loadOrCreateBoard() {
   tiles = freshTiles.map(mapDbTile);
 
   console.log("Created new persistent board in MongoDB.");
+}
+
+async function createNewRound() {
+  const round = {
+    roundId: createRoundId(),
+    startedAt: new Date(),
+    endsAt: new Date(Date.now() + ROUND_DURATION_MS),
+    status: "active",
+  };
+
+  if (databaseConnected) {
+    const savedRound = await Round.create(round);
+    currentRound = mapRound(savedRound);
+  } else {
+    currentRound = mapRound(round);
+  }
+
+  return currentRound;
+}
+
+async function loadOrCreateRound() {
+  if (!databaseConnected) {
+    currentRound = {
+      id: createRoundId(),
+      startedAt: new Date(),
+      endsAt: new Date(Date.now() + ROUND_DURATION_MS),
+      status: "active",
+    };
+    return;
+  }
+
+  const activeRound = await Round.findOne({ status: "active" }).sort({
+    createdAt: -1,
+  });
+
+  if (activeRound && new Date(activeRound.endsAt).getTime() > Date.now()) {
+    currentRound = mapRound(activeRound);
+    return;
+  }
+
+  if (activeRound) {
+    await Round.updateOne(
+      { _id: activeRound._id },
+      {
+        $set: {
+          status: "completed",
+        },
+      }
+    );
+  }
+
+  await createNewRound();
+}
+
+async function loadRoundHistory() {
+  if (!databaseConnected) {
+    roundHistory = [];
+    return;
+  }
+
+  const rounds = await Round.find({ status: "completed" })
+    .sort({ createdAt: -1 })
+    .limit(5);
+
+  roundHistory = rounds.map(mapRound);
 }
 
 async function loadRecentActivity() {
@@ -276,6 +390,15 @@ function sanitizeName(name) {
     .trim()
     .replace(/[<>]/g, "")
     .slice(0, 24);
+}
+
+function sanitizePlayerId(playerId, fallback) {
+  const safe = String(playerId || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9-_]/g, "")
+    .slice(0, 80);
+
+  return safe || fallback;
 }
 
 function getSafeTeam(teamId) {
@@ -402,6 +525,8 @@ function publicState() {
     teamStats: getTeamStats(),
     activityFeed,
     chatMessages,
+    round: currentRound,
+    roundHistory,
     persistence: {
       enabled: databaseConnected,
     },
@@ -432,6 +557,91 @@ async function persistCaptureEvent(event) {
   if (!databaseConnected) return;
 
   await CaptureEvent.create(event);
+}
+
+async function resetBoard() {
+  for (const tile of tiles) {
+    tile.ownerId = null;
+    tile.ownerName = null;
+    tile.teamId = null;
+    tile.teamName = null;
+    tile.teamColor = null;
+    tile.claimedAt = null;
+    tile.lockedUntil = null;
+    tile.version += 1;
+  }
+
+  if (databaseConnected) {
+    await Tile.updateMany(
+      {},
+      {
+        $set: {
+          ownerId: null,
+          ownerName: null,
+          teamId: null,
+          teamName: null,
+          teamColor: null,
+          claimedAt: null,
+          lockedUntil: null,
+        },
+        $inc: {
+          version: 1,
+        },
+      }
+    );
+  }
+
+  lastClaimByUser.clear();
+}
+
+async function finishRoundAndStartNew() {
+  const winningTeam = getTeamStats()[0] || {
+    id: null,
+    name: "No winner",
+    color: "#64748b",
+    score: 0,
+  };
+
+  const winner = {
+    id: winningTeam.id,
+    name: winningTeam.name,
+    color: winningTeam.color,
+    score: winningTeam.score,
+  };
+
+  if (databaseConnected && currentRound?.id) {
+    await Round.updateOne(
+      { roundId: currentRound.id },
+      {
+        $set: {
+          status: "completed",
+          winningTeamId: winningTeam.id,
+          winningTeamName: winningTeam.name,
+          winningTeamColor: winningTeam.color,
+          winningScore: winningTeam.score,
+        },
+      }
+    );
+  }
+
+  addActivity(
+    `${winningTeam.name} won the round with ${winningTeam.score} tiles.`,
+    "round"
+  );
+
+  await resetBoard();
+  await createNewRound();
+  await loadRoundHistory();
+
+  const state = publicState();
+
+  io.emit("round:ended", {
+    winner,
+    roundHistory,
+    state,
+  });
+
+  io.emit("board:state", state);
 }
 
 app.get("/health", (_req, res) => {
@@ -466,10 +676,12 @@ io.on("connection", (socket) => {
       return;
     }
 
+    const playerId = sanitizePlayerId(payload.playerId, socket.id);
     const team = getSafeTeam(payload.teamId);
 
     const user = {
-      id: socket.id,
+      id: playerId,
+      socketId: socket.id,
       name,
       teamId: team.id,
       teamName: team.name,
@@ -477,7 +689,17 @@ io.on("connection", (socket) => {
       joinedAt: new Date().toISOString(),
     };
 
-    users.set(socket.id, user);
+    users.set(playerId, user);
+    socketToPlayer.set(socket.id, playerId);
+
+    for (const tile of tiles) {
+      if (tile.ownerId === playerId) {
+        tile.ownerName = user.name;
+        tile.teamId = user.teamId;
+        tile.teamName = user.teamName;
+        tile.teamColor = user.teamColor;
+      }
+    }
 
     addActivity(`${user.name} joined ${team.name}`, "join");
 
@@ -499,7 +721,9 @@ io.on("connection", (socket) => {
   });
 
   socket.on("cursor:move", (payload = {}) => {
-    const user = users.get(socket.id);
+    const playerId = socketToPlayer.get(socket.id);
+    const user = users.get(playerId);
+
     if (!user) return;
 
     socket.broadcast.emit("cursor:update", {
@@ -513,7 +737,8 @@ io.on("connection", (socket) => {
 
   socket.on("chat:send", async (payload = {}, ack) => {
     try {
-      const user = users.get(socket.id);
+      const playerId = socketToPlayer.get(socket.id);
+      const user = users.get(playerId);
 
       if (!user) {
         ack?.({
@@ -547,12 +772,6 @@ io.on("connection", (socket) => {
         createdAt: new Date().toISOString(),
       };
 
-      chatMessages.push(chatMessage);
-
-      if (chatMessages.length > MAX_CHAT_MESSAGES) {
-        chatMessages.shift();
-      }
-
       if (databaseConnected) {
         const savedMessage = await ChatMessage.create({
           playerId: user.id,
@@ -565,6 +784,12 @@ io.on("connection", (socket) => {
 
         chatMessage.id = String(savedMessage._id);
         chatMessage.createdAt = savedMessage.createdAt;
+      }
+
+      chatMessages.push(chatMessage);
+
+      if (chatMessages.length > MAX_CHAT_MESSAGES) {
+        chatMessages.shift();
       }
 
       io.emit("chat:new", chatMessage);
@@ -583,9 +808,59 @@ io.on("connection", (socket) => {
     }
   });
 
+  socket.on("tile:history", async ({ tileId } = {}, ack) => {
+    try {
+      const tile = getTile(tileId);
+
+      if (!tile) {
+        ack?.({
+          ok: false,
+          reason: "Invalid tile.",
+        });
+        return;
+      }
+
+      if (!databaseConnected) {
+        ack?.({
+          ok: true,
+          history: [],
+        });
+        return;
+      }
+
+      const events = await CaptureEvent.find({ tileId: tile.id })
+        .sort({ createdAt: -1 })
+        .limit(8);
+
+      ack?.({
+        ok: true,
+        history: events.map((event) => ({
+          id: String(event._id),
+          tileId: event.tileId,
+          playerId: event.playerId,
+          playerName: event.playerName,
+          teamId: event.teamId,
+          teamName: event.teamName,
+          previousOwnerId: event.previousOwnerId,
+          previousOwnerName: event.previousOwnerName,
+          type: event.type,
+          createdAt: event.createdAt,
+        })),
+      });
+    } catch (error) {
+      console.error("Tile history failed:", error);
+
+      ack?.({
+        ok: false,
+        reason: "Could not load tile history.",
+      });
+    }
+  });
+
   socket.on("tile:claim", async ({ tileId } = {}, ack) => {
     try {
-      const user = users.get(socket.id);
+      const playerId = socketToPlayer.get(socket.id);
+      const user = users.get(playerId);
       const tile = getTile(tileId);
 
       if (!user) {
@@ -605,7 +880,7 @@ io.on("connection", (socket) => {
       }
 
       const now = Date.now();
-      const lastClaimAt = lastClaimByUser.get(socket.id) || 0;
+      const lastClaimAt = lastClaimByUser.get(user.id) || 0;
 
       if (now - lastClaimAt < CLAIM_COOLDOWN_MS) {
         const waitMs = CLAIM_COOLDOWN_MS - (now - lastClaimAt);
@@ -619,7 +894,8 @@ io.on("connection", (socket) => {
       }
 
       const alreadyOwnedByPlayer = tile.ownerId === user.id;
-      const isLocked = tile.lockedUntil && now < new Date(tile.lockedUntil).getTime();
+      const isLocked =
+        tile.lockedUntil && now < new Date(tile.lockedUntil).getTime();
       const playerScore = getPlayerScore(user.id);
 
       if (alreadyOwnedByPlayer) {
@@ -651,7 +927,7 @@ io.on("connection", (socket) => {
       const previousTeamId = tile.teamId;
       const previousTeamName = tile.teamName;
 
-      lastClaimByUser.set(socket.id, now);
+      lastClaimByUser.set(user.id, now);
 
       tile.ownerId = user.id;
       tile.ownerName = user.name;
@@ -710,14 +986,19 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
-    const user = users.get(socket.id);
+    const playerId = socketToPlayer.get(socket.id);
+    const user = users.get(playerId);
 
     if (user) {
       addActivity(`${user.name} left the arena`, "leave");
     }
 
-    users.delete(socket.id);
-    lastClaimByUser.delete(socket.id);
+    if (playerId) {
+      users.delete(playerId);
+    }
+
+    socketToPlayer.delete(socket.id);
+    lastClaimByUser.delete(playerId);
 
     io.emit("presence:update", {
       onlineCount: users.size,
@@ -726,14 +1007,30 @@ io.on("connection", (socket) => {
     });
 
     io.emit("cursor:remove", {
-      userId: socket.id,
+      userId: playerId || socket.id,
     });
   });
 });
 
+setInterval(async () => {
+  try {
+    if (!currentRound?.endsAt) return;
+
+    const endsAt = new Date(currentRound.endsAt).getTime();
+
+    if (Date.now() >= endsAt) {
+      await finishRoundAndStartNew();
+    }
+  } catch (error) {
+    console.error("Round timer failed:", error);
+  }
+}, 1000);
+
 async function startServer() {
   await connectDatabase();
   await loadOrCreateBoard();
+  await loadOrCreateRound();
+  await loadRoundHistory();
   await loadRecentActivity();
   await loadRecentChatMessages();
 
