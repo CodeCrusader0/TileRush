@@ -1,70 +1,348 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import http from "http";
+import mongoose from "mongoose";
 import { Server } from "socket.io";
 
 const PORT = process.env.PORT || 4000;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:5173";
-const GRID_SIZE = 20;
+const MONGO_URI = process.env.MONGO_URI || "";
+
+const GRID_SIZE = 24;
 const TOTAL_TILES = GRID_SIZE * GRID_SIZE;
-const CLAIM_COOLDOWN_MS = 450;
+const CLAIM_COOLDOWN_MS = 1200;
+const TILE_LOCK_MS = 8000;
+const MAX_FEED_EVENTS = 30;
+const MAX_CHAT_MESSAGES = 40;
 
 const app = express();
-app.use(cors({ origin: CLIENT_ORIGIN }));
+
+function getAllowedOrigin() {
+  if (CLIENT_ORIGIN === "*") return true;
+  return CLIENT_ORIGIN.split(",").map((origin) => origin.trim());
+}
+
+app.use(
+  cors({
+    origin: getAllowedOrigin(),
+  })
+);
+
 app.use(express.json());
 
 const server = http.createServer(app);
+
 const io = new Server(server, {
   cors: {
-    origin: CLIENT_ORIGIN,
-    methods: ["GET", "POST"]
-  }
+    origin: getAllowedOrigin(),
+    methods: ["GET", "POST"],
+  },
 });
 
-const tiles = Array.from({ length: TOTAL_TILES }, (_, id) => ({
-  id,
-  ownerId: null,
-  ownerName: null,
-  ownerColor: null,
-  claimedAt: null
-}));
+const TEAMS = {
+  violet: {
+    id: "violet",
+    name: "Violet Vanguard",
+    color: "#7c3aed",
+  },
+  cyan: {
+    id: "cyan",
+    name: "Cyan Syndicate",
+    color: "#0891b2",
+  },
+  emerald: {
+    id: "emerald",
+    name: "Emerald Empire",
+    color: "#16a34a",
+  },
+  amber: {
+    id: "amber",
+    name: "Amber Alliance",
+    color: "#f59e0b",
+  },
+};
 
+const tileSchema = new mongoose.Schema(
+  {
+    tileId: {
+      type: Number,
+      required: true,
+      unique: true,
+      index: true,
+    },
+    x: Number,
+    y: Number,
+    ownerId: String,
+    ownerName: String,
+    teamId: String,
+    teamName: String,
+    teamColor: String,
+    claimedAt: Date,
+    lockedUntil: Date,
+    version: {
+      type: Number,
+      default: 0,
+    },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+const captureEventSchema = new mongoose.Schema(
+  {
+    tileId: Number,
+    playerId: String,
+    playerName: String,
+    teamId: String,
+    teamName: String,
+    previousOwnerId: String,
+    previousOwnerName: String,
+    previousTeamId: String,
+    previousTeamName: String,
+    type: {
+      type: String,
+      enum: ["claim", "capture"],
+      default: "claim",
+    },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+const chatMessageSchema = new mongoose.Schema(
+  {
+    playerId: String,
+    playerName: String,
+    teamId: String,
+    teamName: String,
+    teamColor: String,
+    message: {
+      type: String,
+      required: true,
+      maxlength: 240,
+    },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+const ChatMessage =
+  mongoose.models.ChatMessage ||
+  mongoose.model("ChatMessage", chatMessageSchema);
+
+const Tile = mongoose.models.Tile || mongoose.model("Tile", tileSchema);
+const CaptureEvent =
+  mongoose.models.CaptureEvent ||
+  mongoose.model("CaptureEvent", captureEventSchema);
+
+let databaseConnected = false;
+let tiles = [];
 const users = new Map();
 const lastClaimByUser = new Map();
+const activityFeed = [];
+const chatMessages = [];
 
-const names = [
-  "Pixel Panda", "Grid Ghost", "Tile Tiger", "Block Boss", "Map Mage",
-  "Cell Surfer", "Color Coder", "Board Ninja", "Claim King", "Dot Wizard"
-];
+function createEmptyTiles() {
+  return Array.from({ length: TOTAL_TILES }, (_, id) => ({
+    id,
+    x: id % GRID_SIZE,
+    y: Math.floor(id / GRID_SIZE),
+    ownerId: null,
+    ownerName: null,
+    teamId: null,
+    teamName: null,
+    teamColor: null,
+    claimedAt: null,
+    lockedUntil: null,
+    version: 0,
+  }));
+}
 
-const colors = [
-  "#7c3aed", "#2563eb", "#0891b2", "#16a34a", "#ca8a04",
-  "#ea580c", "#dc2626", "#db2777", "#4f46e5", "#0f766e"
-];
+function mapDbTile(tile) {
+  return {
+    id: tile.tileId,
+    x: tile.x,
+    y: tile.y,
+    ownerId: tile.ownerId || null,
+    ownerName: tile.ownerName || null,
+    teamId: tile.teamId || null,
+    teamName: tile.teamName || null,
+    teamColor: tile.teamColor || null,
+    claimedAt: tile.claimedAt || null,
+    lockedUntil: tile.lockedUntil || null,
+    version: tile.version || 0,
+  };
+}
 
-function makeGuest(socketId) {
-  const name = `${names[Math.floor(Math.random() * names.length)]} ${socketId.slice(0, 4)}`;
-  const color = colors[Math.floor(Math.random() * colors.length)];
-  return { id: socketId, name, color, score: 0 };
+async function connectDatabase() {
+  if (!MONGO_URI) {
+    console.warn("No MONGO_URI provided. Running with in-memory board only.");
+    databaseConnected = false;
+    return;
+  }
+
+  await mongoose.connect(MONGO_URI);
+  databaseConnected = true;
+  console.log("MongoDB connected. Board state will persist.");
+}
+
+async function loadOrCreateBoard() {
+  if (!databaseConnected) {
+    tiles = createEmptyTiles();
+    return;
+  }
+
+  const existingTiles = await Tile.find().sort({ tileId: 1 });
+
+  if (existingTiles.length === TOTAL_TILES) {
+    tiles = existingTiles.map(mapDbTile);
+    console.log("Loaded persistent board from MongoDB.");
+    return;
+  }
+
+  await Tile.deleteMany({});
+
+  const freshTiles = createEmptyTiles().map((tile) => ({
+    tileId: tile.id,
+    x: tile.x,
+    y: tile.y,
+    ownerId: null,
+    ownerName: null,
+    teamId: null,
+    teamName: null,
+    teamColor: null,
+    claimedAt: null,
+    lockedUntil: null,
+    version: 0,
+  }));
+
+  await Tile.insertMany(freshTiles);
+  tiles = freshTiles.map(mapDbTile);
+
+  console.log("Created new persistent board in MongoDB.");
+}
+
+async function loadRecentActivity() {
+  if (!databaseConnected) return;
+
+  const events = await CaptureEvent.find()
+    .sort({ createdAt: -1 })
+    .limit(MAX_FEED_EVENTS);
+
+  activityFeed.length = 0;
+
+  for (const event of events) {
+    activityFeed.push({
+      id: String(event._id),
+      type: event.type,
+      createdAt: event.createdAt,
+      message:
+        event.type === "capture"
+          ? `${event.playerName} captured tile #${event.tileId} from ${event.previousOwnerName}`
+          : `${event.playerName} claimed tile #${event.tileId}`,
+    });
+  }
+}
+
+async function loadRecentChatMessages() {
+  if (!databaseConnected) return;
+
+  const messages = await ChatMessage.find()
+    .sort({ createdAt: -1 })
+    .limit(MAX_CHAT_MESSAGES);
+
+  chatMessages.length = 0;
+
+  for (const message of messages.reverse()) {
+    chatMessages.push({
+      id: String(message._id),
+      playerId: message.playerId,
+      playerName: message.playerName,
+      teamId: message.teamId,
+      teamName: message.teamName,
+      teamColor: message.teamColor,
+      message: message.message,
+      createdAt: message.createdAt,
+    });
+  }
+}
+
+function sanitizeName(name) {
+  return String(name || "")
+    .trim()
+    .replace(/[<>]/g, "")
+    .slice(0, 24);
+}
+
+function getSafeTeam(teamId) {
+  return TEAMS[teamId] || TEAMS.violet;
+}
+
+function getTile(tileId) {
+  const numericId = Number(tileId);
+
+  if (!Number.isInteger(numericId)) {
+    return null;
+  }
+
+  return tiles[numericId] || null;
+}
+
+function getPlayerScore(playerId) {
+  return tiles.filter((tile) => tile.ownerId === playerId).length;
+}
+
+function getTeamStats() {
+  const stats = Object.values(TEAMS).map((team) => ({
+    ...team,
+    score: 0,
+  }));
+
+  for (const tile of tiles) {
+    if (!tile.teamId) continue;
+
+    const team = stats.find((item) => item.id === tile.teamId);
+
+    if (team) {
+      team.score += 1;
+    }
+  }
+
+  return stats.sort((a, b) => b.score - a.score);
 }
 
 function getLeaderboard() {
   const scores = new Map();
 
   for (const user of users.values()) {
-    scores.set(user.id, { ...user, score: 0 });
+    scores.set(user.id, {
+      id: user.id,
+      name: user.name,
+      teamId: user.teamId,
+      teamName: user.teamName,
+      teamColor: user.teamColor,
+      score: 0,
+    });
   }
 
   for (const tile of tiles) {
     if (!tile.ownerId) continue;
-    const current = scores.get(tile.ownerId) || {
+
+    const existing = scores.get(tile.ownerId) || {
       id: tile.ownerId,
       name: tile.ownerName,
-      color: tile.ownerColor,
-      score: 0
+      teamId: tile.teamId,
+      teamName: tile.teamName,
+      teamColor: tile.teamColor,
+      score: 0,
     };
-    current.score += 1;
-    scores.set(tile.ownerId, current);
+
+    existing.score += 1;
+    scores.set(tile.ownerId, existing);
   }
 
   return [...scores.values()]
@@ -72,17 +350,98 @@ function getLeaderboard() {
     .slice(0, 10);
 }
 
+function addActivity(message, type = "info") {
+  const event = {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    message,
+    type,
+    createdAt: new Date().toISOString(),
+  };
+
+  activityFeed.unshift(event);
+
+  if (activityFeed.length > MAX_FEED_EVENTS) {
+    activityFeed.pop();
+  }
+
+  io.emit("activity:new", event);
+}
+
+function getNeighbourIds(tile) {
+  const positions = [
+    { x: tile.x, y: tile.y - 1 },
+    { x: tile.x + 1, y: tile.y },
+    { x: tile.x, y: tile.y + 1 },
+    { x: tile.x - 1, y: tile.y },
+  ];
+
+  return positions
+    .filter(
+      (position) =>
+        position.x >= 0 &&
+        position.x < GRID_SIZE &&
+        position.y >= 0 &&
+        position.y < GRID_SIZE
+    )
+    .map((position) => position.y * GRID_SIZE + position.x);
+}
+
+function playerHasAdjacentTile(playerId, tile) {
+  return getNeighbourIds(tile).some(
+    (neighbourId) => tiles[neighbourId]?.ownerId === playerId
+  );
+}
+
 function publicState() {
   return {
     gridSize: GRID_SIZE,
     tiles,
+    teams: Object.values(TEAMS),
     onlineCount: users.size,
-    leaderboard: getLeaderboard()
+    leaderboard: getLeaderboard(),
+    teamStats: getTeamStats(),
+    activityFeed,
+    chatMessages,
+    persistence: {
+      enabled: databaseConnected,
+    },
   };
 }
 
+async function persistTile(tile) {
+  if (!databaseConnected) return;
+
+  await Tile.updateOne(
+    { tileId: tile.id },
+    {
+      $set: {
+        ownerId: tile.ownerId,
+        ownerName: tile.ownerName,
+        teamId: tile.teamId,
+        teamName: tile.teamName,
+        teamColor: tile.teamColor,
+        claimedAt: tile.claimedAt,
+        lockedUntil: tile.lockedUntil,
+        version: tile.version,
+      },
+    }
+  );
+}
+
+async function persistCaptureEvent(event) {
+  if (!databaseConnected) return;
+
+  await CaptureEvent.create(event);
+}
+
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, online: users.size, totalTiles: TOTAL_TILES });
+  res.json({
+    ok: true,
+    online: users.size,
+    totalTiles: TOTAL_TILES,
+    gridSize: GRID_SIZE,
+    persistence: databaseConnected,
+  });
 });
 
 app.get("/api/state", (_req, res) => {
@@ -90,87 +449,300 @@ app.get("/api/state", (_req, res) => {
 });
 
 io.on("connection", (socket) => {
-  const user = makeGuest(socket.id);
-  users.set(socket.id, user);
-
-  socket.emit("welcome", { user, state: publicState() });
-  io.emit("presence:update", {
-    onlineCount: users.size,
-    leaderboard: getLeaderboard()
+  socket.emit("connection:ready", {
+    socketId: socket.id,
+    teams: Object.values(TEAMS),
+    state: publicState(),
   });
 
-  socket.on("user:update", (payload = {}) => {
-    const existing = users.get(socket.id);
-    if (!existing) return;
+  socket.on("player:join", (payload = {}, ack) => {
+    const name = sanitizeName(payload.name);
 
-    const safeName = String(payload.name || existing.name).trim().slice(0, 24);
-    const safeColor = /^#[0-9a-fA-F]{6}$/.test(payload.color) ? payload.color : existing.color;
+    if (!name) {
+      ack?.({
+        ok: false,
+        reason: "Enter a player name.",
+      });
+      return;
+    }
 
-    const updated = { ...existing, name: safeName || existing.name, color: safeColor };
-    users.set(socket.id, updated);
+    const team = getSafeTeam(payload.teamId);
 
-    socket.emit("user:updated", updated);
+    const user = {
+      id: socket.id,
+      name,
+      teamId: team.id,
+      teamName: team.name,
+      teamColor: team.color,
+      joinedAt: new Date().toISOString(),
+    };
+
+    users.set(socket.id, user);
+
+    addActivity(`${user.name} joined ${team.name}`, "join");
+
+    socket.emit("player:joined", {
+      user,
+      state: publicState(),
+    });
+
     io.emit("presence:update", {
       onlineCount: users.size,
-      leaderboard: getLeaderboard()
+      leaderboard: getLeaderboard(),
+      teamStats: getTeamStats(),
+    });
+
+    ack?.({
+      ok: true,
+      user,
     });
   });
 
-  socket.on("tile:claim", ({ tileId } = {}, ack) => {
+  socket.on("cursor:move", (payload = {}) => {
     const user = users.get(socket.id);
-    const tile = tiles[Number(tileId)];
+    if (!user) return;
 
-    if (!user || !tile) {
-      ack?.({ ok: false, reason: "Invalid tile." });
-      return;
-    }
-
-    const now = Date.now();
-    const lastClaimAt = lastClaimByUser.get(socket.id) || 0;
-    if (now - lastClaimAt < CLAIM_COOLDOWN_MS) {
-      ack?.({ ok: false, reason: "Slow down a little." });
-      return;
-    }
-
-    if (tile.ownerId) {
-      ack?.({ ok: false, reason: "This tile is already claimed." });
-      return;
-    }
-
-    lastClaimByUser.set(socket.id, now);
-
-    tile.ownerId = user.id;
-    tile.ownerName = user.name;
-    tile.ownerColor = user.color;
-    tile.claimedAt = new Date(now).toISOString();
-
-    const leaderboard = getLeaderboard();
-
-    io.emit("tile:claimed", { tile, leaderboard });
-    ack?.({ ok: true, tile });
+    socket.broadcast.emit("cursor:update", {
+      userId: user.id,
+      name: user.name,
+      teamColor: user.teamColor,
+      x: Number(payload.x) || 0,
+      y: Number(payload.y) || 0,
+    });
   });
 
-  socket.on("board:reset", () => {
-    for (const tile of tiles) {
-      tile.ownerId = null;
-      tile.ownerName = null;
-      tile.ownerColor = null;
-      tile.claimedAt = null;
-    }
+  socket.on("chat:send", async (payload = {}, ack) => {
+    try {
+      const user = users.get(socket.id);
 
-    io.emit("board:state", publicState());
+      if (!user) {
+        ack?.({
+          ok: false,
+          reason: "Join the arena before chatting.",
+        });
+        return;
+      }
+
+      const messageText = String(payload.message || "")
+        .trim()
+        .replace(/[<>]/g, "")
+        .slice(0, 240);
+
+      if (!messageText) {
+        ack?.({
+          ok: false,
+          reason: "Message cannot be empty.",
+        });
+        return;
+      }
+
+      const chatMessage = {
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        playerId: user.id,
+        playerName: user.name,
+        teamId: user.teamId,
+        teamName: user.teamName,
+        teamColor: user.teamColor,
+        message: messageText,
+        createdAt: new Date().toISOString(),
+      };
+
+      chatMessages.push(chatMessage);
+
+      if (chatMessages.length > MAX_CHAT_MESSAGES) {
+        chatMessages.shift();
+      }
+
+      if (databaseConnected) {
+        const savedMessage = await ChatMessage.create({
+          playerId: user.id,
+          playerName: user.name,
+          teamId: user.teamId,
+          teamName: user.teamName,
+          teamColor: user.teamColor,
+          message: messageText,
+        });
+
+        chatMessage.id = String(savedMessage._id);
+        chatMessage.createdAt = savedMessage.createdAt;
+      }
+
+      io.emit("chat:new", chatMessage);
+
+      ack?.({
+        ok: true,
+        message: chatMessage,
+      });
+    } catch (error) {
+      console.error("Chat send failed:", error);
+
+      ack?.({
+        ok: false,
+        reason: "Server error while sending message.",
+      });
+    }
+  });
+
+  socket.on("tile:claim", async ({ tileId } = {}, ack) => {
+    try {
+      const user = users.get(socket.id);
+      const tile = getTile(tileId);
+
+      if (!user) {
+        ack?.({
+          ok: false,
+          reason: "Join the arena first.",
+        });
+        return;
+      }
+
+      if (!tile) {
+        ack?.({
+          ok: false,
+          reason: "Invalid tile.",
+        });
+        return;
+      }
+
+      const now = Date.now();
+      const lastClaimAt = lastClaimByUser.get(socket.id) || 0;
+
+      if (now - lastClaimAt < CLAIM_COOLDOWN_MS) {
+        const waitMs = CLAIM_COOLDOWN_MS - (now - lastClaimAt);
+
+        ack?.({
+          ok: false,
+          reason: `Cooldown active. Wait ${Math.ceil(waitMs / 1000)}s.`,
+        });
+
+        return;
+      }
+
+      const alreadyOwnedByPlayer = tile.ownerId === user.id;
+      const isLocked = tile.lockedUntil && now < new Date(tile.lockedUntil).getTime();
+      const playerScore = getPlayerScore(user.id);
+
+      if (alreadyOwnedByPlayer) {
+        ack?.({
+          ok: false,
+          reason: "You already own this tile.",
+        });
+        return;
+      }
+
+      if (isLocked) {
+        ack?.({
+          ok: false,
+          reason: "This tile is temporarily locked.",
+        });
+        return;
+      }
+
+      if (playerScore > 0 && !playerHasAdjacentTile(user.id, tile)) {
+        ack?.({
+          ok: false,
+          reason: "Expand or attack from your existing territory.",
+        });
+        return;
+      }
+
+      const previousOwnerId = tile.ownerId;
+      const previousOwnerName = tile.ownerName;
+      const previousTeamId = tile.teamId;
+      const previousTeamName = tile.teamName;
+
+      lastClaimByUser.set(socket.id, now);
+
+      tile.ownerId = user.id;
+      tile.ownerName = user.name;
+      tile.teamId = user.teamId;
+      tile.teamName = user.teamName;
+      tile.teamColor = user.teamColor;
+      tile.claimedAt = new Date(now).toISOString();
+      tile.lockedUntil = new Date(now + TILE_LOCK_MS).toISOString();
+      tile.version += 1;
+
+      await persistTile(tile);
+
+      await persistCaptureEvent({
+        tileId: tile.id,
+        playerId: user.id,
+        playerName: user.name,
+        teamId: user.teamId,
+        teamName: user.teamName,
+        previousOwnerId,
+        previousOwnerName,
+        previousTeamId,
+        previousTeamName,
+        type: previousOwnerId ? "capture" : "claim",
+      });
+
+      const leaderboard = getLeaderboard();
+      const teamStats = getTeamStats();
+
+      io.emit("tile:claimed", {
+        tile,
+        leaderboard,
+        teamStats,
+      });
+
+      if (previousOwnerName) {
+        addActivity(
+          `${user.name} captured tile #${tile.id} from ${previousOwnerName}`,
+          "capture"
+        );
+      } else {
+        addActivity(`${user.name} claimed tile #${tile.id}`, "claim");
+      }
+
+      ack?.({
+        ok: true,
+        tile,
+      });
+    } catch (error) {
+      console.error("Tile claim failed:", error);
+
+      ack?.({
+        ok: false,
+        reason: "Server error while claiming tile.",
+      });
+    }
   });
 
   socket.on("disconnect", () => {
+    const user = users.get(socket.id);
+
+    if (user) {
+      addActivity(`${user.name} left the arena`, "leave");
+    }
+
     users.delete(socket.id);
     lastClaimByUser.delete(socket.id);
+
     io.emit("presence:update", {
       onlineCount: users.size,
-      leaderboard: getLeaderboard()
+      leaderboard: getLeaderboard(),
+      teamStats: getTeamStats(),
+    });
+
+    io.emit("cursor:remove", {
+      userId: socket.id,
     });
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`Realtime grid server running on http://localhost:${PORT}`);
+async function startServer() {
+  await connectDatabase();
+  await loadOrCreateBoard();
+  await loadRecentActivity();
+  await loadRecentChatMessages();
+
+  server.listen(PORT, () => {
+    console.log(`TileRush Arena server running on http://localhost:${PORT}`);
+  });
+}
+
+startServer().catch((error) => {
+  console.error("Failed to start server:", error);
+  process.exit(1);
 });

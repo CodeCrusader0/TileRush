@@ -1,209 +1,514 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { io } from "socket.io-client";
 import "./styles.css";
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || "http://localhost:4000";
-const socket = io(SERVER_URL, { autoConnect: true });
+
+const socket = io(SERVER_URL, {
+  transports: ["websocket", "polling"],
+  autoConnect: true,
+});
+
+function formatClock(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Just now";
+
+  return date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
 
 function App() {
-  const [me, setMe] = useState(null);
-  const [gridSize, setGridSize] = useState(20);
+  const boardRef = useRef(null);
+
+  const [connected, setConnected] = useState(false);
+  const [joined, setJoined] = useState(false);
+  const [player, setPlayer] = useState(null);
+
+  const [playerName, setPlayerName] = useState("");
+  const [selectedTeam, setSelectedTeam] = useState("violet");
+
+  const [gridSize, setGridSize] = useState(24);
   const [tiles, setTiles] = useState([]);
+  const [teams, setTeams] = useState([]);
   const [onlineCount, setOnlineCount] = useState(0);
   const [leaderboard, setLeaderboard] = useState([]);
-  const [status, setStatus] = useState("Connecting...");
-  const [nameDraft, setNameDraft] = useState("");
+  const [teamStats, setTeamStats] = useState([]);
+  const [activityFeed, setActivityFeed] = useState([]);
+
   const [selectedTile, setSelectedTile] = useState(null);
+  const [toast, setToast] = useState("");
+  const [lastCapturedTileId, setLastCapturedTileId] = useState(null);
+  const [cursors, setCursors] = useState({});
+
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatDraft, setChatDraft] = useState("");
 
   useEffect(() => {
-    socket.on("connect", () => setStatus("Connected"));
-    socket.on("disconnect", () => setStatus("Disconnected"));
+    socket.on("connect", () => setConnected(true));
+    socket.on("disconnect", () => setConnected(false));
 
-    socket.on("welcome", ({ user, state }) => {
-      setMe(user);
-      setNameDraft(user.name);
-      setGridSize(state.gridSize);
-      setTiles(state.tiles);
-      setOnlineCount(state.onlineCount);
-      setLeaderboard(state.leaderboard);
-      setStatus("Connected");
+    socket.on("connection:ready", ({ teams, state }) => {
+      setTeams(teams || []);
+      hydrateState(state);
     });
 
-    socket.on("board:state", (state) => {
-      setGridSize(state.gridSize);
-      setTiles(state.tiles);
-      setOnlineCount(state.onlineCount);
-      setLeaderboard(state.leaderboard);
+    socket.on("player:joined", ({ user, state }) => {
+      setPlayer(user);
+      setJoined(true);
+      hydrateState(state);
     });
 
-    socket.on("tile:claimed", ({ tile, leaderboard }) => {
-      setTiles((current) => current.map((item) => (item.id === tile.id ? tile : item)));
-      setLeaderboard(leaderboard);
+    socket.on("board:state", hydrateState);
+
+    socket.on("tile:claimed", ({ tile, leaderboard, teamStats }) => {
+      setTiles((current) =>
+        current.map((item) => (item.id === tile.id ? tile : item)),
+      );
+
+      setLeaderboard(leaderboard || []);
+      setTeamStats(teamStats || []);
+      setSelectedTile(tile);
+      setLastCapturedTileId(tile.id);
+
+      window.setTimeout(() => setLastCapturedTileId(null), 650);
     });
 
-    socket.on("presence:update", ({ onlineCount, leaderboard }) => {
-      setOnlineCount(onlineCount);
-      setLeaderboard(leaderboard);
+    socket.on("presence:update", ({ onlineCount, leaderboard, teamStats }) => {
+      setOnlineCount(onlineCount || 0);
+      setLeaderboard(leaderboard || []);
+      setTeamStats(teamStats || []);
     });
 
-    socket.on("user:updated", (user) => {
-      setMe(user);
-      setNameDraft(user.name);
+    socket.on("activity:new", (event) => {
+      setActivityFeed((current) => [event, ...current].slice(0, 30));
+    });
+
+    socket.on("cursor:update", (cursor) => {
+      setCursors((current) => ({
+        ...current,
+        [cursor.userId]: cursor,
+      }));
+    });
+
+    socket.on("cursor:remove", ({ userId }) => {
+      setCursors((current) => {
+        const copy = { ...current };
+        delete copy[userId];
+        return copy;
+      });
+    });
+
+    socket.on("chat:new", (message) => {
+      setChatMessages((current) => [...current, message].slice(-40));
     });
 
     return () => {
       socket.off("connect");
       socket.off("disconnect");
-      socket.off("welcome");
+      socket.off("connection:ready");
+      socket.off("player:joined");
       socket.off("board:state");
       socket.off("tile:claimed");
       socket.off("presence:update");
-      socket.off("user:updated");
+      socket.off("activity:new");
+      socket.off("cursor:update");
+      socket.off("cursor:remove");
+      socket.off("chat:new");
     };
   }, []);
 
-  const claimedCount = useMemo(
-    () => tiles.filter((tile) => tile.ownerId).length,
-    [tiles]
-  );
+  function hydrateState(state) {
+    if (!state) return;
 
-  const myCount = useMemo(
-    () => tiles.filter((tile) => tile.ownerId === me?.id).length,
-    [tiles, me]
-  );
+    setGridSize(state.gridSize || 24);
+    setTiles(state.tiles || []);
+    setTeams(state.teams || []);
+    setOnlineCount(state.onlineCount || 0);
+    setLeaderboard(state.leaderboard || []);
+    setTeamStats(state.teamStats || []);
+    setActivityFeed(state.activityFeed || []);
+    setChatMessages(state.chatMessages || []);
+  }
+
+  function joinArena(event) {
+    event.preventDefault();
+
+    socket.emit(
+      "player:join",
+      {
+        name: playerName,
+        teamId: selectedTeam,
+      },
+      (response) => {
+        if (!response?.ok) {
+          showToast(response?.reason || "Could not join arena.");
+          return;
+        }
+
+        setPlayer(response.user);
+      },
+    );
+  }
 
   function claimTile(tile) {
-    if (!tile || tile.ownerId) {
-      setSelectedTile(tile);
-      return;
-    }
+    if (!tile) return;
 
     setSelectedTile(tile);
-    socket.emit("tile:claim", { tileId: tile.id }, (res) => {
-      if (!res?.ok) setStatus(res?.reason || "Could not claim tile");
-      else setStatus(`Claimed tile #${tile.id}`);
+
+    socket.emit("tile:claim", { tileId: tile.id }, (response) => {
+      if (!response?.ok) {
+        showToast(response?.reason || "Could not claim tile.");
+      }
     });
   }
 
-  function updateProfile(event) {
-    event.preventDefault();
-    socket.emit("user:update", { name: nameDraft, color: me?.color });
+  function showToast(message) {
+    setToast(message);
+    window.setTimeout(() => setToast(""), 2600);
   }
 
-  function updateColor(color) {
-    socket.emit("user:update", { name: nameDraft, color });
+  function handleBoardMouseMove(event) {
+    const rect = boardRef.current?.getBoundingClientRect();
+    if (!rect || !player) return;
+
+    const x = ((event.clientX - rect.left) / rect.width) * 100;
+    const y = ((event.clientY - rect.top) / rect.height) * 100;
+
+    socket.emit("cursor:move", {
+      x: Math.max(0, Math.min(100, x)),
+      y: Math.max(0, Math.min(100, y)),
+    });
+  }
+
+  function sendChatMessage(event) {
+    event.preventDefault();
+
+    const message = chatDraft.trim();
+
+    if (!message) return;
+
+    socket.emit("chat:send", { message }, (response) => {
+      if (!response?.ok) {
+        showToast(response?.reason || "Could not send message.");
+        return;
+      }
+
+      setChatDraft("");
+    });
+  }
+
+  const claimedCount = useMemo(
+    () => tiles.filter((tile) => tile.ownerId).length,
+    [tiles],
+  );
+
+  const myTiles = useMemo(
+    () => tiles.filter((tile) => tile.ownerId === player?.id).length,
+    [tiles, player],
+  );
+
+  const claimPercent = Math.round((claimedCount / (tiles.length || 1)) * 100);
+
+  if (!joined) {
+    return (
+      <main className="join-page">
+        <section className="join-card">
+          <div className="brand-orb" />
+
+          <p className="eyebrow">Realtime Multiplayer Territory Arena</p>
+          <h1>TileRush Arena</h1>
+          <p className="subtitle">
+            Capture tiles, expand territory, attack nearby rivals, and climb the
+            live leaderboard. Every move is synced instantly.
+          </p>
+
+          <form className="join-form" onSubmit={joinArena}>
+            <label>
+              Player name
+              <input
+                value={playerName}
+                onChange={(event) => setPlayerName(event.target.value)}
+                placeholder="Enter your name"
+                maxLength={24}
+              />
+            </label>
+
+            <div>
+              <span className="label-text">Choose your faction</span>
+              <div className="team-picker">
+                {teams.map((team) => (
+                  <button
+                    key={team.id}
+                    type="button"
+                    className={`team-option ${
+                      selectedTeam === team.id ? "active" : ""
+                    }`}
+                    onClick={() => setSelectedTeam(team.id)}
+                  >
+                    <span
+                      className="team-dot"
+                      style={{ background: team.color }}
+                    />
+                    <span>{team.name}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {toast && <p className="error-text">{toast}</p>}
+
+            <button className="primary-button" type="submit">
+              Join Arena
+            </button>
+          </form>
+
+          <div className="connection-pill">
+            <span className={connected ? "online-dot" : "offline-dot"} />
+            {connected ? "Connected to server" : "Connecting..."}
+          </div>
+        </section>
+      </main>
+    );
   }
 
   return (
-    <main className="app-shell">
-      <section className="hero-card">
+    <main className="arena-page">
+      {toast && <div className="toast">{toast}</div>}
+
+      <header className="topbar">
         <div>
-          <p className="eyebrow">Realtime multiplayer board</p>
-          <h1>TileRush</h1>
+          <p className="eyebrow">TileRush Arena</p>
+          <h1>Live Territory Control</h1>
+          <p className="topbar-copy">
+            Cooldowns, tile locks, adjacent expansion, team scoring, and
+            real-time multiplayer updates.
+          </p>
         </div>
 
-        <div className="status-pill">
-          <span className={socket.connected ? "pulse online" : "pulse offline"} />
-          {status}
+        <div className="topbar-stats">
+          <StatCard label="Online" value={onlineCount} />
+          <StatCard label="Your tiles" value={myTiles} />
+          <StatCard label="Map claimed" value={`${claimPercent}%`} />
         </div>
-      </section>
+      </header>
 
-      <section className="layout">
-        <aside className="panel profile-panel">
+      <section className="arena-layout">
+        <aside className="panel">
           <div className="panel-header">
-            <h2>Your player</h2>
-            <span className="mini-chip">{onlineCount} online</span>
+            <h2>Your Player</h2>
+            <span className="mini-chip">Live</span>
           </div>
 
-          {me && (
-            <form onSubmit={updateProfile} className="profile-form">
-              <label>Name</label>
-              <input value={nameDraft} onChange={(e) => setNameDraft(e.target.value)} maxLength={24} />
+          <div className="player-card">
+            <span className="avatar" style={{ background: player?.teamColor }}>
+              {player?.name?.[0]?.toUpperCase()}
+            </span>
+            <div>
+              <strong>{player?.name}</strong>
+              <p>{player?.teamName}</p>
+            </div>
+          </div>
 
-              <label>Color</label>
-              <div className="color-row">
-                {["#7c3aed", "#2563eb", "#0891b2", "#16a34a", "#ea580c", "#dc2626", "#db2777"].map((color) => (
-                  <button
-                    key={color}
-                    type="button"
-                    className={`color-dot ${me.color === color ? "active" : ""}`}
-                    style={{ background: color }}
-                    onClick={() => updateColor(color)}
-                    aria-label={`Use color ${color}`}
+          <div className="rules-box">
+            <h3>Rules</h3>
+            <p>First tile can be anywhere.</p>
+            <p>After that, expand only from your existing territory.</p>
+            <p>Captured tiles are briefly locked from attacks.</p>
+          </div>
+
+          <div className="panel-header">
+            <h2>Team Control</h2>
+          </div>
+
+          <div className="team-stats">
+            {teamStats.map((team) => (
+              <div key={team.id} className="team-stat">
+                <div>
+                  <span
+                    className="team-dot"
+                    style={{ background: team.color }}
                   />
-                ))}
+                  <span>{team.name}</span>
+                </div>
+                <strong>{team.score}</strong>
               </div>
-
-              <button className="primary-button">Save profile</button>
-            </form>
-          )}
-
-          <div className="stats-grid">
-            <Stat label="Your tiles" value={myCount} />
-            <Stat label="Claimed" value={`${claimedCount}/${tiles.length || 400}`} />
+            ))}
           </div>
-
-          <button className="ghost-button" onClick={() => socket.emit("board:reset")}>Reset demo board</button>
         </aside>
 
         <section className="board-card">
           <div className="board-toolbar">
             <div>
-              <h2>Shared map</h2>
-              <p>Free tiles are light. Claimed tiles use each player’s color.</p>
+              <h2>Battle Map</h2>
+              <p>
+                Click a tile to capture it. Owned tiles can be attacked only
+                from adjacent territory.
+              </p>
             </div>
+
             <div className="progress-wrap">
-              <span>{Math.round((claimedCount / (tiles.length || 1)) * 100)}% claimed</span>
-              <div className="progress-bar"><div style={{ width: `${(claimedCount / (tiles.length || 1)) * 100}%` }} /></div>
+              <span>
+                {claimedCount}/{tiles.length} tiles claimed
+              </span>
+              <div className="progress-bar">
+                <div style={{ width: `${claimPercent}%` }} />
+              </div>
             </div>
           </div>
 
-          <div className="grid-wrap">
+          <div
+            ref={boardRef}
+            className="grid-wrap"
+            onMouseMove={handleBoardMouseMove}
+          >
+            {Object.values(cursors).map((cursor) => (
+              <div
+                key={cursor.userId}
+                className="remote-cursor"
+                style={{
+                  left: `${cursor.x}%`,
+                  top: `${cursor.y}%`,
+                  color: cursor.teamColor,
+                }}
+              >
+                <span />
+                <b>{cursor.name}</b>
+              </div>
+            ))}
+
             <div
               className="grid"
-              style={{ gridTemplateColumns: `repeat(${gridSize}, minmax(18px, 1fr))` }}
+              style={{
+                gridTemplateColumns: `repeat(${gridSize}, minmax(15px, 1fr))`,
+              }}
             >
               {tiles.map((tile) => (
                 <button
-                  key={tile.id}
-                  className={`tile ${tile.ownerId ? "claimed" : "free"} ${tile.ownerId === me?.id ? "mine" : ""}`}
-                  style={{ background: tile.ownerColor || undefined }}
+                  key={`${tile.id}-${tile.version}`}
+                  className={[
+                    "tile",
+                    tile.ownerId ? "claimed" : "free",
+                    tile.ownerId === player?.id ? "mine" : "",
+                    lastCapturedTileId === tile.id ? "captured" : "",
+                  ].join(" ")}
+                  style={{ background: tile.teamColor || undefined }}
+                  onMouseEnter={() => setSelectedTile(tile)}
                   onClick={() => claimTile(tile)}
-                  title={tile.ownerName ? `Owned by ${tile.ownerName}` : "Unclaimed"}
+                  title={
+                    tile.ownerName
+                      ? `#${tile.id} owned by ${tile.ownerName}`
+                      : `#${tile.id} unclaimed`
+                  }
                 />
               ))}
             </div>
           </div>
         </section>
 
-        <aside className="panel leaderboard-panel">
+        <aside className="panel">
           <div className="panel-header">
             <h2>Leaderboard</h2>
-            <span className="mini-chip">Top owners</span>
+            <span className="mini-chip">Top 10</span>
           </div>
 
           <div className="leaderboard">
-            {leaderboard.length === 0 && <p className="empty">No claims yet. Be first.</p>}
-            {leaderboard.map((player, index) => (
-              <div className="leader-row" key={player.id}>
+            {leaderboard.length === 0 && (
+              <p className="empty">No captures yet. Be first.</p>
+            )}
+
+            {leaderboard.map((item, index) => (
+              <div className="leader-row" key={item.id}>
                 <span className="rank">#{index + 1}</span>
-                <span className="avatar" style={{ background: player.color }} />
-                <div className="leader-name">{player.name}</div>
-                <strong>{player.score}</strong>
+                <span
+                  className="leader-avatar"
+                  style={{ background: item.teamColor }}
+                />
+                <div className="leader-name">
+                  <strong>{item.name}</strong>
+                  <small>{item.teamName}</small>
+                </div>
+                <b>{item.score}</b>
               </div>
             ))}
           </div>
 
           <div className="tile-detail">
-            <h3>Selected tile</h3>
+            <h3>Tile Inspector</h3>
             {selectedTile ? (
-              <p>
-                Tile #{selectedTile.id} · {selectedTile.ownerName ? `Owned by ${selectedTile.ownerName}` : "Unclaimed"}
-              </p>
+              <>
+                <p>
+                  <strong>Tile #{selectedTile.id}</strong>
+                </p>
+                <p>
+                  Owner:{" "}
+                  {selectedTile.ownerName
+                    ? selectedTile.ownerName
+                    : "Unclaimed"}
+                </p>
+                <p>
+                  Team: {selectedTile.teamName ? selectedTile.teamName : "None"}
+                </p>
+                <p>
+                  Claimed:{" "}
+                  {selectedTile.claimedAt
+                    ? formatClock(selectedTile.claimedAt)
+                    : "Not yet"}
+                </p>
+              </>
             ) : (
-              <p>Click any tile to inspect it.</p>
+              <p>Hover or click a tile to inspect it.</p>
             )}
+          </div>
+
+          <div className="chat-box">
+            <h3>Arena Chat</h3>
+
+            <div className="chat-messages">
+              {chatMessages.length === 0 && (
+                <p className="empty">
+                  No messages yet. Start the conversation.
+                </p>
+              )}
+
+              {chatMessages.map((message) => (
+                <div key={message.id} className="chat-message">
+                  <div className="chat-meta">
+                    <span
+                      className="chat-dot"
+                      style={{ background: message.teamColor }}
+                    />
+                    <strong>{message.playerName}</strong>
+                  </div>
+                  <p>{message.message}</p>
+                </div>
+              ))}
+            </div>
+
+            <form className="chat-form" onSubmit={sendChatMessage}>
+              <input
+                value={chatDraft}
+                onChange={(event) => setChatDraft(event.target.value)}
+                placeholder="Type message..."
+                maxLength={240}
+              />
+              <button type="submit">Send</button>
+            </form>
+          </div>
+
+          <div className="activity-box">
+            <h3>Live Feed</h3>
+            <div className="activity-feed">
+              {activityFeed.length === 0 && (
+                <p className="empty">No activity yet.</p>
+              )}
+
+              {activityFeed.map((event) => (
+                <p key={event.id}>{event.message}</p>
+              ))}
+            </div>
           </div>
         </aside>
       </section>
@@ -211,11 +516,11 @@ function App() {
   );
 }
 
-function Stat({ label, value }) {
+function StatCard({ label, value }) {
   return (
     <div className="stat-card">
-      <strong>{value}</strong>
       <span>{label}</span>
+      <strong>{value}</strong>
     </div>
   );
 }
